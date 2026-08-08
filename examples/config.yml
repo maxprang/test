@@ -1,0 +1,126 @@
+# restore-guard — example configuration
+#
+# Secrets belong in the environment, not in this file:
+#   ${VAR}            -> required, aborts if unset
+#   ${VAR:-fallback}  -> optional with a default
+
+version: 1
+
+defaults:
+  workdir: /var/lib/restore-guard     # state DB + temporary restores live here
+  timeout: 45m                        # per job: restore + all checks
+  max_age: 7d                         # a job counts as STALE after this long without success
+  keep_on_failure: true               # leave a failed restore on disk for inspection
+  history_limit: 200                  # runs kept per job
+  metrics_file: /var/lib/node_exporter/textfile/restore_guard.prom
+
+notify:
+  ntfy:
+    url: https://ntfy.sh/${NTFY_TOPIC}
+    on: [failure, recovery]
+    tags: [floppy_disk]
+  # webhook:
+  #   url: https://homeassistant.lan/api/webhook/restore-guard
+  #   on: [failure]
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) Postgres dump out of restic, replayed into a throwaway container.
+  #    The strongest routine check: if this passes, the database is real.
+  # ------------------------------------------------------------------
+  - name: immich-db
+    description: "Immich Postgres dump — the photos are worthless without it"
+    source:
+      type: restic
+      repository: /mnt/backup/restic
+      password_file: /etc/restore-guard/restic.pass
+      snapshot: latest
+      paths: ["/srv/backup/immich"]
+    verify:
+      - type: files
+        min_bytes: 5MB
+        must_exist: ["**/immich*.sql.gz"]
+      - type: postgres
+        dump: "**/immich*.sql.gz"
+        image: postgres:16-alpine
+        min_tables: 20
+        checks:
+          - name: assets present
+            sql: "SELECT count(*) FROM assets"
+            expect_min: 1000
+          - name: no orphaned users
+            sql: "SELECT count(*) FROM users WHERE email IS NULL"
+            expect_equals: 0
+    max_age: 3d
+    timeout: 1h
+
+  # ------------------------------------------------------------------
+  # 2) A random snapshot, not the newest one. Verifying only last night
+  #    proves last night worked — not that the retention chain survived.
+  # ------------------------------------------------------------------
+  - name: homeassistant-config
+    source:
+      type: borg
+      repository: ssh://borg@nas.lan/./repos/ha
+      passphrase: ${BORG_PASSPHRASE}
+      snapshot: random
+    verify:
+      - type: files
+        min_files: 50
+        must_exist: ["**/configuration.yaml", "**/.storage/core.config_entries"]
+        must_not_exist: ["**/*.corrupt"]
+      - type: sqlite
+        path: "**/home-assistant_v2.db"
+        integrity_check: true
+        queries:
+          - name: recent states
+            sql: "SELECT count(*) FROM states"
+            expect_min: 100
+
+  # ------------------------------------------------------------------
+  # 3) Plain tarballs in a directory — rsnapshot, cron, Proxmox dumps.
+  #    'newer_than' catches the classic silent failure: the job still
+  #    runs every night but has been backing up nothing for months.
+  # ------------------------------------------------------------------
+  - name: vaultwarden
+    source:
+      type: local
+      repository: /mnt/backup/vaultwarden
+      pattern: "vaultwarden-*.tar.gz"
+      snapshot: latest
+    verify:
+      - type: files
+        min_bytes: 100KB
+        newer_than: 36h
+        must_exist: ["**/db.sqlite3", "**/rsa_key.pem"]
+      - type: sqlite
+        path: "**/db.sqlite3"
+        queries:
+          - sql: "SELECT count(*) FROM users"
+            expect_min: 1
+      # Boot the real application against the restored data directory.
+      - type: http
+        image: vaultwarden/server:latest
+        mount: /data
+        port: 80
+        path: /alive
+        expect_status: 200
+        read_only: false
+        env:
+          I_REALLY_WANT_VOLATILE_STORAGE: "true"
+
+  # ------------------------------------------------------------------
+  # 4) Anything else: run your own script against the restore.
+  # ------------------------------------------------------------------
+  - name: photos-checksums
+    enabled: false
+    source:
+      type: local
+      repository: /mnt/backup/photos
+      snapshot: random
+    verify:
+      - type: command
+        name: manifest matches
+        run: ["sha256sum", "--quiet", "-c", "manifest.sha256"]
+        expect_returncode: 0
+    max_age: 30d

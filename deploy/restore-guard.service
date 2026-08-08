@@ -1,0 +1,35 @@
+[Unit]
+Description=Verify that backups can actually be restored
+Documentation=https://github.com/maxprang/test
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restore-guard --config /etc/restore-guard/config.yml run --quiet
+
+# Secrets: keep passphrases out of the config file.
+EnvironmentFile=-/etc/restore-guard/env
+
+# A verification run competes with everything else on the box for IO. Losing.
+Nice=10
+IOSchedulingClass=idle
+CPUWeight=20
+
+# The tool only ever reads backups and writes to its workdir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/restore-guard /var/lib/node_exporter/textfile
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+# A large restore of a cold repository can take a while; the per-job timeout
+# in config.yml is the real limit, this is only a backstop.
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=multi-user.target

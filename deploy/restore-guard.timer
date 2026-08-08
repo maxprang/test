@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly backup restore verification
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+
+# Spread the load: without this every homelab timer fires at exactly 03:30 and
+# the NAS spends an hour saturated.
+RandomizedDelaySec=45m
+
+# Catch up after downtime — a missed verification is a blind spot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
