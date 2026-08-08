@@ -8,6 +8,7 @@ on the SDK: every homelab already has the CLI, and the surface we need is tiny.
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -20,17 +21,44 @@ class DockerError(RuntimeError):
     """Docker is unavailable or a container misbehaved."""
 
 
+#: Daemon reachability, cached per binary. Jobs may probe from several threads.
+_AVAILABILITY: dict[str, bool] = {}
+_AVAILABILITY_LOCK = threading.Lock()
+
+
+def reset_availability_cache() -> None:
+    """Forget cached daemon reachability (tests, long-lived processes)."""
+    with _AVAILABILITY_LOCK:
+        _AVAILABILITY.clear()
+
+
 class Docker:
     def __init__(self, binary: str = "docker", logger: Logger | None = None):
         self.binary = binary
         self.log = logger or Logger(quiet=True)
 
     def available(self) -> bool:
+        """Whether the daemon answers. Cached per binary for the process lifetime.
+
+        A job configuring both `postgres` and `http` would otherwise spawn
+        `docker info` once per verifier, and the answer cannot change between
+        two checks of the same run.
+        """
+        with _AVAILABILITY_LOCK:
+            if self.binary in _AVAILABILITY:
+                return _AVAILABILITY[self.binary]
+
         try:
             require_binary(self.binary)
+            verdict = run(
+                [self.binary, "info", "--format", "{{.ServerVersion}}"], timeout=30
+            ).ok
         except CommandError:
-            return False
-        return run([self.binary, "info", "--format", "{{.ServerVersion}}"], timeout=30).ok
+            verdict = False
+
+        with _AVAILABILITY_LOCK:
+            _AVAILABILITY[self.binary] = verdict
+        return verdict
 
     def require(self) -> None:
         if not self.available():

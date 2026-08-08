@@ -9,7 +9,7 @@ from typing import Any
 
 from ..config import ConfigError, JobConfig
 from ..sources import Snapshot
-from ..util import Logger
+from ..util import DirStats, Logger, PathEscape, dir_stats, ensure_within
 
 
 @dataclass
@@ -21,14 +21,28 @@ class VerifyContext:
     job: JobConfig
     timeout: float
     log: Logger
+    #: Filled in by the runner, which already walked the tree to log the restore.
+    stats: DirStats | None = None
 
     def resolve(self, relative: str) -> Path:
         """Resolve a config path against the restore dir, refusing to escape it."""
-        candidate = (self.restore_dir / relative).resolve()
-        root = self.restore_dir.resolve()
-        if not str(candidate).startswith(str(root)):
-            raise VerifyError(f"path {relative!r} points outside the restore directory")
-        return candidate
+        try:
+            return ensure_within(self.restore_dir, relative)
+        except PathEscape as exc:
+            raise VerifyError(
+                f"path {relative!r} points outside the restore directory"
+            ) from exc
+
+    def tree_stats(self) -> DirStats:
+        """File count and size of the restore, walked at most once per job.
+
+        Walking a restored tree costs one lstat per file; on the multi-TB
+        restores this tool is built for, doing it once per verifier instead of
+        once per job is the difference between seconds and minutes.
+        """
+        if self.stats is None:
+            self.stats = dir_stats(self.restore_dir)
+        return self.stats
 
 
 @dataclass

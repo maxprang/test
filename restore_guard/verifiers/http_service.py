@@ -14,6 +14,7 @@ from typing import Any
 
 from ..config import ConfigError
 from ..docker import Docker, DockerError
+from ..util import as_list
 from . import VerifyContext, VerifyError, VerifyResult, Verifier, register
 
 
@@ -79,10 +80,10 @@ class HttpServiceVerifier(Verifier):
                     if status != expect_status:
                         problems.append(f"HTTP {status}, expected {expect_status}")
                         details["container_logs"] = docker.logs(container, 25)
-                    for needle in _as_list(self.spec.get("contains")):
+                    for needle in as_list(self.spec.get("contains")):
                         if str(needle) not in body:
                             problems.append(f"response does not contain {needle!r}")
-                    for needle in _as_list(self.spec.get("excludes")):
+                    for needle in as_list(self.spec.get("excludes")):
                         if str(needle) in body:
                             problems.append(f"response unexpectedly contains {needle!r}")
         except DockerError as exc:
@@ -115,11 +116,3 @@ def _poll(url: str, timeout: float, spec: dict[str, Any]) -> tuple[int | None, s
             last_error = str(getattr(exc, "reason", exc))
             time.sleep(2.0)
     return None, "", last_error
-
-
-def _as_list(value: Any) -> list[Any]:
-    if value in (None, ""):
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]

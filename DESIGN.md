@@ -44,6 +44,18 @@ Repository, es kennt nur Lesen und Wiederherstellen.
                               (+ Exit-Code)      (ntfy/webhook)       Textfile
 ```
 
+Geteilte Bausteine, bewusst je an genau einer Stelle:
+
+| Modul                        | Enthält                                                          |
+|------------------------------|------------------------------------------------------------------|
+| `util.py`                    | `as_list`, `shell_quote`, `parse_iso_time`, `ensure_within`, `dir_stats`, `run` |
+| `verifiers/checks.py`        | die Erwartungs-Sprache (`expect_min/max/equals/contains`)         |
+| `verifiers/container_db.py`  | Dump finden, Container hochfahren, einspielen, abfragen           |
+
+Das ist keine Kosmetik: als die Vergleichslogik dreimal kopiert existierte, hatte
+die SQLite-Kopie bereits still `expect_contains` verloren. Eine Implementierung
+kann nicht auseinanderlaufen.
+
 Zwei Erweiterungspunkte, beide über ein Registry-Decorator (`@register`):
 
 - **Source** (`restore_guard/sources/`) — kann Snapshots auflisten und einen in
@@ -148,6 +160,17 @@ einmal komplett durch, ohne dass je eine Nacht blockiert ist.
 Ein fremdes Feature zu benutzen statt ein eigenes halb zu bauen, ist hier die
 bessere Lösung — auch wenn es bedeutet, dass borg und local diese Prüfung nicht
 haben.
+
+### Der Restore-Baum wird einmal pro Job gelaufen
+
+`dir_stats()` kostet ein `lstat` pro Datei. Der Runner läuft den Baum ohnehin,
+um „restored 12.483 files (2,4 GiB)" zu protokollieren, und reicht das Ergebnis
+über `VerifyContext.stats` weiter. Bei einem Job mit drei `files`-Checks waren
+das vorher vier vollständige Walks über womöglich mehrere TB.
+
+`VerifyContext.tree_stats()` fällt auf einen eigenen Walk zurück, wenn niemand
+vorgerechnet hat — Verifier bleiben damit außerhalb des Runners benutzbar, etwa
+in Tests.
 
 ### Timeouts als Budget, nicht pro Schritt
 

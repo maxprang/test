@@ -11,7 +11,7 @@ import time
 from typing import Any
 
 from ..config import ConfigError
-from ..util import CommandError, expand_placeholders, run
+from ..util import CommandError, as_list, expand_placeholders, run
 from . import VerifyContext, VerifyError, VerifyResult, Verifier, register
 
 
@@ -71,12 +71,15 @@ class CommandVerifier(Verifier):
         elif result.returncode != expected_rc:
             problems.append(f"exit code {result.returncode}, expected {expected_rc}")
 
-        output = (result.stdout or "") + (result.stderr or "")
-        for needle in _as_list(self.spec.get("stdout_contains")):
-            if str(needle) not in output:
+        # Search the two streams separately rather than concatenating them:
+        # a checksum manifest over a large restore produces one line per file,
+        # and a joined copy would double that in memory for no benefit.
+        streams = (result.stdout or "", result.stderr or "")
+        for needle in as_list(self.spec.get("stdout_contains")):
+            if not any(str(needle) in stream for stream in streams):
                 problems.append(f"output does not contain {needle!r}")
-        for needle in _as_list(self.spec.get("stdout_excludes")):
-            if str(needle) in output:
+        for needle in as_list(self.spec.get("stdout_excludes")):
+            if any(str(needle) in stream for stream in streams):
                 problems.append(f"output unexpectedly contains {needle!r}")
 
         details: dict[str, Any] = {
@@ -89,11 +92,3 @@ class CommandVerifier(Verifier):
         verify_result = self.failed(summary, **details) if problems else self.ok(summary, **details)
         verify_result.duration = time.monotonic() - started
         return verify_result
-
-
-def _as_list(value: Any) -> list[Any]:
-    if value in (None, ""):
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]

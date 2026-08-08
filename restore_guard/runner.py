@@ -18,8 +18,8 @@ from .state import (
     RunRecord,
     State,
 )
-from .util import Logger, dir_stats, human_bytes, human_duration, rmtree_quiet
-from .verifiers import VerifyError, VerifyResult, build_verifiers
+from .util import DirStats, Logger, dir_stats, human_bytes, human_duration, rmtree_quiet
+from .verifiers import VerifyContext, VerifyError, VerifyResult, build_verifiers
 
 
 @dataclass
@@ -132,7 +132,7 @@ class Runner:
             )
 
             remaining = max(30.0, budget - outcome.duration)
-            results = self._verify(job, verifiers, restore_dir, snapshot, remaining)
+            results = self._verify(job, verifiers, restore_dir, snapshot, remaining, stats)
 
             failures = [r for r in results if not r.ok]
             status = STATUS_FAILED if failures else STATUS_OK
@@ -182,9 +182,8 @@ class Runner:
         restore_dir: Path,
         snapshot: Snapshot,
         budget: float,
+        stats: DirStats,
     ) -> list[VerifyResult]:
-        from .verifiers import VerifyContext
-
         results: list[VerifyResult] = []
         deadline = time.monotonic() + budget
 
@@ -207,6 +206,7 @@ class Runner:
                 job=job,
                 timeout=remaining,
                 log=self.log,
+                stats=stats,
             )
             try:
                 result = verifier.run(ctx)

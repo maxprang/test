@@ -71,21 +71,38 @@ def collect(config: Config, state: State) -> list[JobStatus]:
     return statuses
 
 
-def status_table(statuses: list[JobStatus]) -> str:
-    headers = ("JOB", "STATUS", "VERIFIED", "SNAPSHOT", "SIZE", "TOOK", "DETAIL")
-    rows = [headers]
+def detail_text(status: JobStatus, limit: int) -> str:
+    """Why a job is not simply OK, in one line.
 
+    Shared by the terminal table and the HTML page so the two can never explain
+    the same state differently; only the truncation length differs.
+    """
+    run = status.last_run
+    if run is not None and not run.ok:
+        return (run.message.splitlines()[0][:limit] if run.message else run.status)
+    if status.last_success is None:
+        return "never successfully verified"
+    if status.stale:
+        return f"older than {human_duration(status.max_age)}"
+    return ""
+
+
+def render_table(header: tuple[str, ...], rows: list[tuple]) -> str:
+    """Left-aligned fixed-width table with a dashed rule under the header."""
+    all_rows = [header, *rows]
+    widths = [max(len(str(row[i])) for row in all_rows) for i in range(len(header))]
+
+    lines = ["  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(header)).rstrip()]
+    lines.append("  ".join("-" * width for width in widths))
+    for row in rows:
+        lines.append("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
+    return "\n".join(lines)
+
+
+def status_table(statuses: list[JobStatus]) -> str:
+    rows = []
     for status in statuses:
         success = status.last_success
-        run = status.last_run
-        detail = ""
-        if run is not None and not run.ok:
-            detail = run.message.splitlines()[0][:60] if run.message else run.status
-        elif status.stale and success is not None:
-            detail = f"older than {human_duration(status.max_age)}"
-        elif success is None:
-            detail = "never successfully verified"
-
         rows.append(
             (
                 status.name,
@@ -94,42 +111,29 @@ def status_table(statuses: list[JobStatus]) -> str:
                 (success.snapshot_id or "-")[:12] if success else "-",
                 human_bytes(success.bytes) if success else "-",
                 human_duration(success.duration) if success else "-",
-                detail,
+                detail_text(status, limit=60),
             )
         )
-
-    widths = [max(len(str(row[i])) for row in rows) for i in range(len(headers))]
-    lines = []
-    for index, row in enumerate(rows):
-        line = "  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)).rstrip()
-        lines.append(line)
-        if index == 0:
-            lines.append("  ".join("-" * width for width in widths))
-    return "\n".join(lines)
+    return render_table(
+        ("JOB", "STATUS", "VERIFIED", "SNAPSHOT", "SIZE", "TOOK", "DETAIL"), rows
+    )
 
 
 def history_table(records: list[RunRecord]) -> str:
     if not records:
         return "no runs recorded yet"
-    rows = [("WHEN", "JOB", "STATUS", "SNAPSHOT", "TOOK", "MESSAGE")]
-    for record in records:
-        rows.append(
-            (
-                time.strftime("%Y-%m-%d %H:%M", time.localtime(record.started_at)),
-                record.job,
-                record.status,
-                (record.snapshot_id or "-")[:12],
-                human_duration(record.duration),
-                (record.message.splitlines()[0][:70] if record.message else ""),
-            )
+    rows = [
+        (
+            time.strftime("%Y-%m-%d %H:%M", time.localtime(record.started_at)),
+            record.job,
+            record.status,
+            (record.snapshot_id or "-")[:12],
+            human_duration(record.duration),
+            (record.message.splitlines()[0][:70] if record.message else ""),
         )
-    widths = [max(len(str(row[i])) for row in rows) for i in range(len(rows[0]))]
-    lines = []
-    for index, row in enumerate(rows):
-        lines.append("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)).rstrip())
-        if index == 0:
-            lines.append("  ".join("-" * width for width in widths))
-    return "\n".join(lines)
+        for record in records
+    ]
+    return render_table(("WHEN", "JOB", "STATUS", "SNAPSHOT", "TOOK", "MESSAGE"), rows)
 
 
 def json_report(statuses: list[JobStatus]) -> str:
@@ -292,16 +296,7 @@ def html_report(statuses: list[JobStatus]) -> str:
     rows = []
     for status in statuses:
         success = status.last_success
-        run = status.last_run
-        if run is not None and not run.ok and run.message:
-            detail = run.message.splitlines()[0][:200]
-        elif status.stale and success is not None:
-            detail = f"older than {human_duration(status.max_age)}"
-        elif success is None:
-            detail = "never successfully verified"
-        else:
-            detail = ""
-
+        detail = detail_text(status, limit=200)
         rows.append(
             "        <tr>"
             f"<td class=\"job\">{_html(status.name)}</td>"

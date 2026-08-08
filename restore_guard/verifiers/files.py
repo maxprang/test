@@ -10,8 +10,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..config import ConfigError
-from ..util import dir_stats, human_bytes, human_duration, parse_duration, parse_size
+from ..config import ConfigError, duration_or_raise, size_or_raise
+from ..util import as_list, human_bytes, human_duration
 from . import VerifyContext, VerifyResult, Verifier, register
 
 
@@ -19,62 +19,64 @@ from . import VerifyContext, VerifyResult, Verifier, register
 class FilesVerifier(Verifier):
     type = "files"
 
+    #: Conditions this verifier understands; at least one must be configured,
+    #: otherwise the check would pass unconditionally.
+    CONDITIONS = ("min_files", "min_bytes", "must_exist", "must_not_exist", "newer_than")
+
     def validate(self) -> None:
-        if self.spec.get("min_bytes") is not None:
-            self._parsed_min_bytes = _size(self.spec["min_bytes"], "verify.files.min_bytes")
-        else:
-            self._parsed_min_bytes = None
-        if self.spec.get("newer_than") is not None:
-            self._parsed_newer_than = _duration(
-                self.spec["newer_than"], "verify.files.newer_than"
-            )
-        else:
-            self._parsed_newer_than = None
+        self.min_bytes = (
+            size_or_raise(self.spec["min_bytes"], "verify.files.min_bytes")
+            if self.spec.get("min_bytes") is not None
+            else None
+        )
+        self.newer_than = (
+            duration_or_raise(self.spec["newer_than"], "verify.files.newer_than")
+            if self.spec.get("newer_than") is not None
+            else None
+        )
         if not any(
-            key in self.spec
-            for key in ("min_files", "min_bytes", "must_exist", "must_not_exist", "newer_than")
-        ):
+key in self.spec for key in self.CONDITIONS):
             raise ConfigError(
                 f"job {self.job.name!r}: verify.files needs at least one condition "
-                "(min_files, min_bytes, must_exist, must_not_exist, newer_than)"
+                f"({', '.join(self.CONDITIONS)})"
             )
 
     def run(self, ctx: VerifyContext) -> VerifyResult:
         started = time.monotonic()
-        stats = dir_stats(ctx.restore_dir)
+        stats = ctx.tree_stats()
         problems: list[str] = []
 
         min_files = self.spec.get("min_files")
         if min_files is not None and stats.files < int(min_files):
             problems.append(f"only {stats.files} files restored, expected >= {min_files}")
 
-        if self._parsed_min_bytes is not None and stats.bytes < self._parsed_min_bytes:
+        if self.min_bytes is not None and stats.bytes < self.min_bytes:
             problems.append(
                 f"only {human_bytes(stats.bytes)} restored, "
-                f"expected >= {human_bytes(self._parsed_min_bytes)}"
+                f"expected >= {human_bytes(self.min_bytes)}"
             )
 
-        for pattern in _as_list(self.spec.get("must_exist")):
+        for pattern in as_list(self.spec.get("must_exist")):
             matches = list(ctx.restore_dir.glob(str(pattern)))
             if not matches:
                 problems.append(f"missing from backup: {pattern}")
 
-        for pattern in _as_list(self.spec.get("must_not_exist")):
+        for pattern in as_list(self.spec.get("must_not_exist")):
             matches = list(ctx.restore_dir.glob(str(pattern)))
             if matches:
                 problems.append(
                     f"unexpectedly present: {pattern} ({len(matches)} match(es))"
                 )
 
-        if self._parsed_newer_than is not None:
+        if self.newer_than is not None:
             if stats.newest_mtime is None:
                 problems.append("no files at all, cannot check freshness")
             else:
                 age = max(0.0, time.time() - stats.newest_mtime)
-                if age > self._parsed_newer_than:
+                if age > self.newer_than:
                     problems.append(
                         f"newest file is {human_duration(age)} old, "
-                        f"expected younger than {human_duration(self._parsed_newer_than)}"
+                        f"expected younger than {human_duration(self.newer_than)}"
                     )
 
         details: dict[str, Any] = {
@@ -95,24 +97,3 @@ class FilesVerifier(Verifier):
         result.duration = duration
         return result
 
-
-def _as_list(value: Any) -> list[Any]:
-    if value in (None, ""):
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
-
-
-def _size(value: Any, where: str) -> int:
-    try:
-        return parse_size(value)
-    except ValueError as exc:
-        raise ConfigError(f"{where}: {exc}") from exc
-
-
-def _duration(value: Any, where: str) -> int:
-    try:
-        return parse_duration(value)
-    except ValueError as exc:
-        raise ConfigError(f"{where}: {exc}") from exc

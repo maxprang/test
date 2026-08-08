@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import ConfigError
-from ..util import CommandError, require_binary, run
+from ..util import CommandError, PathEscape, ensure_within, require_binary, run
 from . import RestoreOutcome, Snapshot, Source, SourceError, register
 
 _TAR_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tar.xz", ".txz", ".tar.zst")
@@ -112,7 +112,7 @@ class LocalSource(Source):
 
         try:
             with tarfile.open(source_path) as archive:
-                _safe_extract(archive, dest)
+                _safe_extract(archive, dest, source_path.name)
         except (tarfile.TarError, OSError) as exc:
             raise SourceError(f"cannot extract {source_path.name}: {exc}") from exc
         return f"python tarfile extract of {source_path.name}"
@@ -128,7 +128,7 @@ def _looks_like_missing_codec(message: str) -> bool:
     return "zstd" in lowered or "unrecognized" in lowered or "cannot exec" in lowered
 
 
-def _safe_extract(archive: tarfile.TarFile, dest: Path) -> None:
+def _safe_extract(archive: tarfile.TarFile, dest: Path, source_label: str) -> None:
     """Extract while refusing paths that escape the destination directory.
 
     Backup archives are trusted-ish, but a verifier that unpacks `../../etc/passwd`
@@ -136,9 +136,10 @@ def _safe_extract(archive: tarfile.TarFile, dest: Path) -> None:
     """
     root = dest.resolve()
     for member in archive.getmembers():
-        target = (root / member.name).resolve()
-        if not str(target).startswith(str(root)):
-            raise SourceError(f"archive member escapes restore directory: {member.name}")
+        try:
+            ensure_within(root, member.name, f"archive member {member.name!r}")
+        except PathEscape as exc:
+            raise SourceError(f"refusing to extract {source_label}: {exc}") from exc
     extract_kwargs: dict[str, Any] = {}
     if hasattr(tarfile, "data_filter"):  # Python >= 3.12 warns without this
         extract_kwargs["filter"] = "data"

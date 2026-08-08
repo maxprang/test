@@ -9,6 +9,7 @@ Exit codes are the contract for cron/systemd/monitoring:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from .report import (
     write_atomic,
 )
 from .runner import Runner
-from .sources import known_sources
+from .sources import build_source, known_sources
 from .state import State
 from .util import Logger
 from .verifiers import build_verifiers, known_verifiers
@@ -183,17 +184,13 @@ def _cmd_history(args, config: Config, logger: Logger) -> int:
     with State(config.state_path) as state:
         records = state.history(args.job, args.limit)
     if args.json:
-        import json as _json
-
-        print(_json.dumps([record.to_dict() for record in records], indent=2, default=str))
+        print(json.dumps([record.to_dict() for record in records], indent=2, default=str))
     else:
         print(history_table(records))
     return EXIT_OK
 
 
 def _cmd_validate(args, config: Config, logger: Logger) -> int:
-    from .sources import build_source
-
     problems = 0
     for job in config.jobs:
         try:

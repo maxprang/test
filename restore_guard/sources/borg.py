@@ -4,11 +4,9 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
-from ..util import CommandError, require_binary, run
+from ..util import CommandError, as_list, parse_iso_time, require_binary, run
 from . import RestoreOutcome, Snapshot, Source, SourceError, register
 
 
@@ -52,7 +50,7 @@ class BorgSource(Source):
 
     def list_snapshots(self) -> list[Snapshot]:
         argv = [self.binary, "list", "--json", str(self.spec["repository"])]
-        for prefix in _as_list(self.spec.get("prefix")):
+        for prefix in as_list(self.spec.get("prefix")):
             argv += ["--glob-archives", f"{prefix}*"]
         result = run(argv, env=self._env(), timeout=300)
         if not result.ok:
@@ -68,7 +66,7 @@ class BorgSource(Source):
             snapshots.append(
                 Snapshot(
                     id=name,
-                    time=_parse_time(entry.get("time") or entry.get("start")),
+                    time=parse_iso_time(entry.get("time") or entry.get("start")),
                     label=name,
                     raw=entry,
                 )
@@ -79,8 +77,8 @@ class BorgSource(Source):
         # borg extract writes into the current working directory, so we chdir
         # into the (already created, empty) restore target instead of passing it.
         argv = [self.binary, "extract", f"{self.spec['repository']}::{snapshot.id}"]
-        argv += [str(p) for p in _as_list(self.spec.get("paths"))]
-        for pattern in _as_list(self.spec.get("exclude")):
+        argv += [str(p) for p in as_list(self.spec.get("paths"))]
+        for pattern in as_list(self.spec.get("exclude")):
             argv += ["--exclude", str(pattern)]
 
         started = time.monotonic()
@@ -98,20 +96,3 @@ class BorgSource(Source):
             duration=time.monotonic() - started,
             log=result.stderr.strip(),
         )
-
-
-def _as_list(value: Any) -> list[Any]:
-    if value in (None, ""):
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
-
-
-def _parse_time(value: Any) -> float | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None

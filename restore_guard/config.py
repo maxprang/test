@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-from .util import parse_duration
+from .util import parse_duration, parse_size
 
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -140,8 +140,8 @@ def build_config(raw: dict[str, Any]) -> Config:
     workdir = Path(defaults.get("workdir", "/var/lib/restore-guard")).expanduser()
     keep_on_failure = bool(defaults.get("keep_on_failure", True))
     history_limit = int(defaults.get("history_limit", 200))
-    default_timeout = _duration(defaults.get("timeout", "30m"), "defaults.timeout")
-    default_max_age = _duration(defaults.get("max_age", "7d"), "defaults.max_age")
+    default_timeout = duration_or_raise(defaults.get("timeout", "30m"), "defaults.timeout")
+    default_max_age = duration_or_raise(defaults.get("max_age", "7d"), "defaults.max_age")
 
     metrics_file = defaults.get("metrics_file")
     metrics_path = Path(metrics_file).expanduser() if metrics_file else None
@@ -191,7 +191,14 @@ def _build_job(raw_job: Any, index: int, default_timeout: int, default_max_age: 
     source = raw_job.get("source")
     _require_mapping(source, f"{where}.source")
     if not source.get("type"):
-        raise ConfigError(f"{where}.source: 'type' is required (restic, borg, local)")
+        # Ask the registry rather than hardcoding a list here: this layer knows
+        # nothing about individual source types, and a literal list silently
+        # goes stale the moment one is added.
+        from .sources import known_sources
+
+        raise ConfigError(
+            f"{where}.source: 'type' is required ({', '.join(known_sources())})"
+        )
 
     verify = raw_job.get("verify")
     if not verify:
@@ -212,8 +219,8 @@ def _build_job(raw_job: Any, index: int, default_timeout: int, default_max_age: 
         source=source,
         verify=verify,
         enabled=bool(raw_job.get("enabled", True)),
-        max_age=_duration(raw_job.get("max_age", default_max_age), f"{where}.max_age"),
-        timeout=_duration(raw_job.get("timeout", default_timeout), f"{where}.timeout"),
+        max_age=duration_or_raise(raw_job.get("max_age", default_max_age), f"{where}.max_age"),
+        timeout=duration_or_raise(raw_job.get("timeout", default_timeout), f"{where}.timeout"),
         keep_on_failure=None if keep is None else bool(keep),
         tags=list(raw_job.get("tags") or []),
         description=str(raw_job.get("description") or ""),
@@ -247,8 +254,20 @@ def _require_mapping(value: Any, where: str) -> None:
         raise ConfigError(f"{where} must be a mapping, got {type(value).__name__}")
 
 
-def _duration(value: Any, where: str) -> int:
+def duration_or_raise(value: Any, where: str) -> int:
+    """Parse a duration, reporting failures as a ConfigError naming the field."""
     try:
         return parse_duration(value)
     except ValueError as exc:
         raise ConfigError(f"{where}: {exc}") from exc
+
+
+def size_or_raise(value: Any, where: str) -> int:
+    """Parse a byte size, reporting failures as a ConfigError naming the field."""
+    try:
+        return parse_size(value)
+    except ValueError as exc:
+        raise ConfigError(f"{where}: {exc}") from exc
+
+
+

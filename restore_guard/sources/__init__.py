@@ -59,9 +59,13 @@ class Source(ABC):
 
     def validate(self) -> None:
         """Raise ConfigError for anything we can detect without touching the repo."""
+        # Either a named strategy or a literal snapshot id — both are strings.
         strategy = self.spec.get("snapshot", "latest")
-        if strategy not in SELECT_STRATEGIES and not isinstance(strategy, str):
-            raise ConfigError(f"job {self.job.name!r}: source.snapshot must be a string")
+        if not isinstance(strategy, str):
+            raise ConfigError(
+                f"job {self.job.name!r}: source.snapshot must be a string "
+                f"({', '.join(SELECT_STRATEGIES)} or a snapshot id), got {strategy!r}"
+            )
 
     def _required(self, key: str) -> Any:
         value = self.spec.get(key)

@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 _DURATION_RE = re.compile(r"(\d+)\s*([smhdw])")
@@ -39,6 +40,24 @@ _SIZE_UNITS = {
 
 class UtilError(ValueError):
     """Raised when a helper cannot make sense of its input."""
+
+
+def as_list(value) -> list:
+    """Normalise a YAML scalar-or-list field into a list.
+
+    Config files let you write ``paths: /srv/data`` or ``paths: [/a, /b]``;
+    every source and verifier that reads such a field goes through here.
+    """
+    if value in (None, "", []):
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def shell_quote(value) -> str:
+    """Single-quote a value for a POSIX shell command line."""
+    return "'" + str(value).replace("'", "'\\''") + "'"
 
 
 def parse_duration(value) -> int:
@@ -104,6 +123,48 @@ def human_bytes(count: float | None) -> str:
             return f"{value:.0f}{unit}" if unit == "B" else f"{value:.1f}{unit}"
         value /= step
     return f"{value:.1f}TiB"
+
+
+def parse_iso_time(value) -> float | None:
+    """Parse a backup tool's RFC 3339 timestamp into epoch seconds.
+
+    Tolerates the trailing ``Z`` and over-long fractional seconds — restic
+    emits nanoseconds, which ``fromisoformat`` rejects. Returns None rather
+    than raising: a snapshot with an unreadable timestamp should still be
+    listed, just sorted as undated.
+    """
+    if not value:
+        return None
+    text = str(value)
+    if "." in text:
+        head, _, tail = text.partition(".")
+        fraction = "".join(ch for ch in tail if ch.isdigit())[:6]
+        suffix = tail[len(fraction) :].lstrip("0123456789")
+        text = f"{head}.{fraction or '0'}{suffix}"
+    text = text.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def ensure_within(root: Path, candidate: Path | str, label: str | None = None) -> Path:
+    """Resolve ``candidate`` under ``root``, refusing anything that escapes it.
+
+    One mechanism for both places that need it: verifier config paths, and
+    members of a tar archive being unpacked. Symlinks are resolved first, so
+    a link pointing outside is caught too.
+    """
+    root_resolved = root.resolve()
+    resolved = (root_resolved / candidate).resolve()
+    if resolved != root_resolved and root_resolved not in resolved.parents:
+        what = label if label else repr(str(candidate))
+        raise PathEscape(f"{what} points outside {root_resolved}")
+    return resolved
+
+
+class PathEscape(ValueError):
+    """A configured or archived path would leave its designated directory."""
 
 
 @dataclass

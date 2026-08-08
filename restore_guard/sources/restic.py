@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any
 
 from ..config import ConfigError
-from ..util import CommandError, require_binary, run
+from ..util import CommandError, as_list, parse_iso_time, require_binary, run
 from . import RestoreOutcome, Snapshot, Source, SourceError, register
 
 
@@ -60,9 +58,9 @@ class ResticSource(Source):
 
     def _filter_argv(self) -> list[str]:
         argv: list[str] = []
-        for host in _as_list(self.spec.get("host")):
+        for host in as_list(self.spec.get("host")):
             argv += ["--host", str(host)]
-        for tag in _as_list(self.spec.get("tags")):
+        for tag in as_list(self.spec.get("tags")):
             argv += ["--tag", str(tag)]
         return argv
 
@@ -112,7 +110,7 @@ class ResticSource(Source):
             snapshots.append(
                 Snapshot(
                     id=str(entry.get("id", "")),
-                    time=_parse_time(entry.get("time")),
+                    time=parse_iso_time(entry.get("time")),
                     label=str(entry.get("short_id") or entry.get("id", ""))[:12],
                     raw=entry,
                 )
@@ -121,9 +119,9 @@ class ResticSource(Source):
 
     def restore(self, snapshot: Snapshot, dest: Path, timeout: float) -> RestoreOutcome:
         argv = self._base_argv() + ["restore", snapshot.id, "--target", str(dest)]
-        for path in _as_list(self.spec.get("paths")):
+        for path in as_list(self.spec.get("paths")):
             argv += ["--include", str(path)]
-        for pattern in _as_list(self.spec.get("exclude")):
+        for pattern in as_list(self.spec.get("exclude")):
             argv += ["--exclude", str(pattern)]
         if self.spec.get("verify", False):
             # restic >= 0.16: re-hash restored files against the repository index.
@@ -144,28 +142,3 @@ class ResticSource(Source):
             duration=time.monotonic() - started,
             log=result.stdout.strip(),
         )
-
-
-def _as_list(value: Any) -> list[Any]:
-    if value in (None, ""):
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
-
-
-def _parse_time(value: Any) -> float | None:
-    if not value:
-        return None
-    text = str(value)
-    # restic emits RFC3339 with nanoseconds, which fromisoformat rejects before 3.11.
-    if "." in text:
-        head, _, tail = text.partition(".")
-        fraction = "".join(ch for ch in tail if ch.isdigit())[:6]
-        suffix = tail[len(fraction) :].lstrip("0123456789")
-        text = f"{head}.{fraction or '0'}{suffix}"
-    text = text.replace("Z", "+00:00")
-    try:
-        return datetime.fromisoformat(text).timestamp()
-    except ValueError:
-        return None

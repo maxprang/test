@@ -10,8 +10,8 @@ import sqlite3
 import time
 from typing import Any
 
-from ..config import ConfigError
 from . import VerifyContext, VerifyError, VerifyResult, Verifier, register
+from .checks import QueryFailed, run_checks, validate_check_specs
 
 
 @register
@@ -20,11 +20,9 @@ class SqliteVerifier(Verifier):
 
     def validate(self) -> None:
         self._required("path")
-        for position, check in enumerate(self.spec.get("queries") or []):
-            if not isinstance(check, dict) or not check.get("sql"):
-                raise ConfigError(
-                    f"job {self.job.name!r}: verify.sqlite.queries[{position}] needs 'sql'"
-                )
+        self.query_specs = validate_check_specs(
+            self.spec.get("queries"), f"job {self.job.name!r}: verify.sqlite.queries"
+        )
 
     def run(self, ctx: VerifyContext) -> VerifyResult:
         started = time.monotonic()
@@ -57,12 +55,10 @@ class SqliteVerifier(Verifier):
                 if broken:
                     problems.append(f"{len(broken)} foreign key violation(s)")
 
-            query_results = []
-            for check in self.spec.get("queries") or []:
-                outcome = _run_query(connection, check)
-                query_results.append(outcome)
-                if outcome["problem"]:
-                    problems.append(outcome["problem"])
+            query_results, query_problems = run_checks(
+                self.query_specs, lambda spec: _scalar(connection, spec)
+            )
+            problems += query_problems
             if query_results:
                 details["queries"] = query_results
         except sqlite3.DatabaseError as exc:
@@ -77,36 +73,10 @@ class SqliteVerifier(Verifier):
         return result
 
 
-def _run_query(connection: sqlite3.Connection, check: dict[str, Any]) -> dict[str, Any]:
-    sql = str(check["sql"])
-    label = str(check.get("name") or sql[:60])
+def _scalar(connection: sqlite3.Connection, spec: dict[str, Any]):
+    """Run one query and return its first cell."""
     try:
-        row = connection.execute(sql).fetchone()
+        row = connection.execute(str(spec["sql"])).fetchone()
     except sqlite3.Error as exc:
-        return {"name": label, "value": None, "problem": f"{label}: query failed ({exc})"}
-
-    value = row[0] if row else None
-    problem = _compare(label, value, check)
-    return {"name": label, "value": value, "problem": problem}
-
-
-def _compare(label: str, value: Any, check: dict[str, Any]) -> str | None:
-    """Shared expectation logic: min/max/equals against the first cell."""
-    if "expect_min" in check or "expect_max" in check:
-        try:
-            numeric = float(value)
-        except (TypeError, ValueError):
-            return f"{label}: expected a number, got {value!r}"
-        minimum = check.get("expect_min")
-        maximum = check.get("expect_max")
-        if minimum is not None and numeric < float(minimum):
-            return f"{label}: {_fmt(numeric)} < expected minimum {minimum}"
-        if maximum is not None and numeric > float(maximum):
-            return f"{label}: {_fmt(numeric)} > expected maximum {maximum}"
-    if "expect_equals" in check and str(value) != str(check["expect_equals"]):
-        return f"{label}: got {value!r}, expected {check['expect_equals']!r}"
-    return None
-
-
-def _fmt(value: float) -> str:
-    return str(int(value)) if float(value).is_integer() else f"{value:.3f}"
+        raise QueryFailed(f"query failed ({exc})") from exc
+    return row[0] if row else None
