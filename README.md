@@ -35,16 +35,26 @@ vaultwarden            FAIL    9d02h ago  vw-2026-07-30 1.2MiB   12s     db.sqli
 | `sqlite`   | `PRAGMA integrity_check`, Fremdschlüssel, eigene Count-Queries   | nein           |
 | `command`  | beliebiges Skript (`sha256sum -c`, `gpg --verify`, …)            | nein           |
 | `postgres` | Dump in Wegwerf-Container einspielen + SQL-Checks                | **ja**         |
+| `mysql`    | dito für MySQL/MariaDB, optional `CHECK TABLE` über alles        | **ja**         |
 | `http`     | echtes Image gegen die Daten starten und HTTP abfragen           | **ja**         |
 
 Die Reihenfolge ist Absicht. `files` mit `min_bytes` und `newer_than` fängt den
 mit Abstand häufigsten realen Ausfall: Der Job läuft jede Nacht brav durch und
 sichert seit Monaten fast nichts, weil ein Pfad umgezogen ist oder eine
-Exclude-Regel zu gierig wurde. `postgres` und `http` beantworten die eigentliche
-Frage — *würde der Dienst damit wieder hochkommen?*
+Exclude-Regel zu gierig wurde. `postgres`, `mysql` und `http` beantworten die
+eigentliche Frage — *würde der Dienst damit wieder hochkommen?*
 
-Unterstützte Backup-Quellen: **restic**, **borg**, **local** (Verzeichnisse und
-Tarballs — rsnapshot, `pg_dump | gzip`, Proxmox-Dumps, jedes Cron-Skript).
+Backup-Quellen:
+
+| Quelle   | Für                                                                        |
+|----------|----------------------------------------------------------------------------|
+| `restic` | restic-Repos, optional mit `read_data_subset`-Stichprobe gegen Bit Rot      |
+| `borg`   | BorgBackup, lokal oder über SSH                                            |
+| `local`  | Verzeichnisse und Tarballs: rsnapshot, `pg_dump \| gzip`, Proxmox, Cron    |
+| `zfs`    | ZFS-Snapshots per Clone — kein Kopieren, auch bei mehreren TB in Sekunden  |
+
+Btrfs braucht bewusst keine eigene Quelle: dessen Snapshots *sind* Verzeichnisse,
+`type: local` mit `pattern` deckt sie ab.
 
 ## Installation
 
@@ -101,7 +111,10 @@ jobs:
 |------------------------------|------------------------------------------------------------|
 | `run [job…]`                 | wiederherstellen und prüfen (ohne Argument: alle aktiven)   |
 | `run --dry-run`              | Repo erreichbar? Snapshot wählbar? Ohne Restore.            |
-| `status [--json]`            | Tabelle: letzte bewiesene Wiederherstellung je Job          |
+| `run --parallel N`           | bis zu N Jobs gleichzeitig                                  |
+| `status`                     | Tabelle: letzte bewiesene Wiederherstellung je Job          |
+| `status --json`              | dasselbe maschinenlesbar                                    |
+| `status --html [datei]`      | fertige Statusseite fürs Dashboard                          |
 | `history [job] [--limit N]`  | letzte Läufe                                                |
 | `validate`                   | Config auf Fehler prüfen                                    |
 | `metrics`                    | Prometheus-Textfile ausgeben/schreiben                      |
@@ -121,7 +134,9 @@ jobs:
 | `max_age`         | `7d`                     | danach gilt ein Job als `STALE`                  |
 | `keep_on_failure` | `true`                   | fehlgeschlagenen Restore liegen lassen           |
 | `history_limit`   | `200`                    | behaltene Läufe je Job                           |
+| `parallel`        | `1`                      | wie viele Jobs gleichzeitig                      |
 | `metrics_file`    | –                        | Pfad für den node_exporter Textfile Collector    |
+| `report_file`     | –                        | Pfad für die HTML-Statusseite                    |
 
 Zeiten: `30s`, `45m`, `12h`, `7d`, `1h30m`. Größen: `100KB`, `512KiB`, `2GiB`.
 
@@ -166,10 +181,38 @@ source:
   mode: auto                         # auto | copy | tar
 ```
 
+```yaml
+source:
+  type: zfs
+  dataset: rpool/data/vmdata         # Datasetname, kein Pfad
+  snapshot: random
+  clone_base: rpool/restore-guard    # muss "restore-guard" enthalten
+```
+
+Der ZFS-Source kopiert nichts: er legt einen read-only Clone an, mountet ihn aufs
+Restore-Verzeichnis und zerstört ihn danach. Damit werden auch mehrere TB in
+Sekunden prüfbar. `zfs destroy` ist der einzige destruktive Befehl im ganzen
+Programm und läuft nur, wenn drei unabhängige Bedingungen gleichzeitig gelten:
+Der Name enthält `restore-guard`, das Dataset hat ein `origin` (ist also
+wirklich ein Clone), und es hat keine Kind-Datasets. Schlägt eine davon fehl,
+bleibt der Clone stehen und es gibt eine Warnung — verschenkter Plattenplatz ist
+billiger als ein falsches `destroy`.
+
+Der ZFS-Source braucht root (oder passende `zfs allow`-Delegation) und ist als
+einziger Teil **nicht in der Testsuite mit echtem ZFS erprobt** — die Tests
+faken die CLI und prüfen Namensberechnung und Sicherheitscheck. Vor dem
+produktiven Einsatz einmal mit einem Wegwerf-Dataset gegenprüfen.
+
 **`snapshot: random` ist der wichtigste Schalter.** Immer nur das neueste
 Snapshot zu prüfen beweist, dass letzte Nacht funktioniert hat — nicht, dass die
 Retention-Kette intakt ist. Genau die brauchst du, wenn du merkst, dass die
 Ransomware schon seit drei Wochen mitgesichert wird.
+
+Ergänzend für restic: `read_data_subset: 2%` lässt vor dem Restore
+`restic check --read-data-subset` laufen. Das prüft die Pack-Dateien selbst, also
+auch Blobs, die kein wiederhergestelltes Snapshot anfasst. Ein voller
+`--read-data`-Lauf ist auf mehreren TB ein Wochenendprojekt; 2% pro Nacht laufen
+in einem Monat einmal komplett durch.
 
 ### Verifier
 
@@ -219,6 +262,27 @@ wiederhergestellten Stand verändert.
 Startet einen Wegwerf-Container, spielt den Dump mit `ON_ERROR_STOP=1` ein und
 fragt ab. Ein Dump, der existiert und sauber entpackt, kann trotzdem eine
 abgeschnittene Transaktion sein — das merkst du nur beim echten Einspielen.
+</details>
+
+<details>
+<summary><code>mysql</code> — MySQL und MariaDB</summary>
+
+```yaml
+- type: mysql
+  dump: "*.sql.gz"                   # .sql oder .sql.gz/.bz2/.xz/.zst
+  image: mariadb:11                  # oder mysql:8
+  min_tables: 50
+  check_tables: true                 # CHECK TABLE über alle Tabellen
+  checks:
+    - name: users present
+      sql: "SELECT count(*) FROM oc_users"
+      expect_min: 1
+```
+`check_tables` ist der Grund, diesen Verifier dem reinen `files`-Check
+vorzuziehen: es findet den `mysqldump`, der ohne `--single-transaction` auf
+einer belasteten Datenbank lief und Tabellen mitten im Schreiben erwischt hat.
+Der Client wird zur Laufzeit gewählt (`mariadb` oder `mysql`), damit beide
+Image-Familien funktionieren.
 </details>
 
 <details>
@@ -319,6 +383,31 @@ Die eine Alert-Regel, die zählt:
     summary: "{{ $labels.job }} wurde zu lange nicht erfolgreich wiederhergestellt"
 ```
 
+### Statusseite
+
+```yaml
+defaults:
+  report_file: /var/www/homelab/restore-guard.html
+```
+
+Schreibt nach jedem Lauf eine fertige HTML-Seite: keine externen Assets, kein
+JavaScript, hell/dunkel je nach System, alle fünf Minuten Auto-Refresh. Damit
+lässt sie sich in Homer, Dashy oder ein `iframe` einhängen — und rendert auch
+dann noch, wenn gerade das halbe Netz steht. Einmalig geht auch
+`restore-guard status --html seite.html`.
+
+### Parallel
+
+```yaml
+defaults:
+  parallel: 3
+```
+
+Standard ist seriell, und das ist bei wenigen großen Jobs auch richtig: drei
+gleichzeitige Restores von derselben NAS sind langsamer als drei nacheinander.
+Bei vielen kleinen Jobs lohnt es sich. `--parallel N` übersteuert die Config für
+einen einzelnen Lauf.
+
 ## Platzbedarf und Last
 
 Ein Restore braucht kurzzeitig so viel Platz wie die wiederhergestellten Daten.
@@ -348,12 +437,14 @@ Erfolgreiche Restores werden sofort gelöscht, fehlgeschlagene bleiben unter
 ## Grenzen
 
 - Kein Scheduler an Bord — das macht systemd oder cron besser.
-- `postgres` und `http` brauchen einen erreichbaren Docker-Daemon; ohne ihn
-  scheitert der Check mit klarer Meldung statt zu crashen.
+- `postgres`, `mysql` und `http` brauchen einen erreichbaren Docker-Daemon; ohne
+  ihn scheitert der Check mit klarer Meldung statt zu crashen.
 - Docker-Mounts brauchen Host-Pfade: läuft restore-guard selbst im Container,
   muss `workdir` ein Bind-Mount mit identischem Pfad auf dem Host sein.
-- MySQL/MariaDB ist noch nicht als eigener Verifier dabei — bis dahin geht
-  `command` mit einem `mysql`-Client-Aufruf.
+- Der `zfs`-Source braucht root und ist nicht gegen echtes ZFS getestet (siehe
+  oben) — die anderen Quellen und Verifier sind es.
+- Ein grüner Lauf beweist, dass die *Daten* heil sind. Er beweist nicht, dass du
+  weißt, in welcher Reihenfolge du deine 14 Dienste wieder hochziehst.
 
 ## Entwicklung
 

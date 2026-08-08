@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import sys
 import tarfile
@@ -21,11 +22,7 @@ def backup_dir(tmp_path: Path) -> Path:
         (snapshot / "data.bin").write_bytes(b"x" * (2048 * (index + 1)))
         stamp = time.time() - (86400 * (2 - index))
         for path in snapshot.rglob("*"):
-            import os
-
             os.utime(path, (stamp, stamp))
-        import os
-
         os.utime(snapshot, (stamp, stamp))
     return repo
 

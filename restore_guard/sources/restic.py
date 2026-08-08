@@ -78,6 +78,25 @@ class ResticSource(Source):
                 f"restic repository {self.spec['repository']!r} not readable: {result.tail()}"
             )
 
+        subset = self.spec.get("read_data_subset")
+        if subset:
+            # Re-hash a slice of the actual pack files. A full `restic check
+            # --read-data` on a multi-TB repo is a weekend job; a few percent per
+            # night walks the whole repository over a month and catches bit rot
+            # in blobs that no snapshot we restore happens to touch.
+            check = run(
+                self._base_argv()
+                + ["check", "--read-data-subset", str(subset), "--no-cache"],
+                env=self._env(),
+                timeout=float(self.spec.get("check_timeout", 3600)),
+            )
+            if not check.ok:
+                hint = "timed out" if check.timed_out else check.tail()
+                raise SourceError(
+                    f"restic check --read-data-subset={subset} found problems: {hint}"
+                )
+            self.log.debug(f"restic check --read-data-subset={subset} passed")
+
     def list_snapshots(self) -> list[Snapshot]:
         argv = self._base_argv() + ["snapshots", "--json"] + self._filter_argv()
         result = run(argv, env=self._env(), timeout=300)

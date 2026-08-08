@@ -12,7 +12,9 @@ defaults:
   max_age: 7d                         # a job counts as STALE after this long without success
   keep_on_failure: true               # leave a failed restore on disk for inspection
   history_limit: 200                  # runs kept per job
+  parallel: 1                         # raise only if your storage can take it
   metrics_file: /var/lib/node_exporter/textfile/restore_guard.prom
+  report_file: /var/www/homelab/restore-guard.html
 
 notify:
   ntfy:
@@ -36,6 +38,9 @@ jobs:
       password_file: /etc/restore-guard/restic.pass
       snapshot: latest
       paths: ["/srv/backup/immich"]
+      # Re-hash 2% of the pack files each night. Over a month this walks the
+      # whole repository and finds bit rot in blobs no restore happens to touch.
+      read_data_subset: 2%
     verify:
       - type: files
         min_bytes: 5MB
@@ -110,7 +115,52 @@ jobs:
           I_REALLY_WANT_VOLATILE_STORAGE: "true"
 
   # ------------------------------------------------------------------
-  # 4) Anything else: run your own script against the restore.
+  # 4) MySQL/MariaDB — same idea as postgres. `check_tables` runs
+  #    CHECK TABLE over everything, which catches the classic mysqldump
+  #    taken without --single-transaction on a busy database.
+  # ------------------------------------------------------------------
+  - name: nextcloud-db
+    source:
+      type: local
+      repository: /mnt/backup/nextcloud
+      pattern: "nextcloud-db-*.sql.gz"
+      snapshot: random
+    verify:
+      - type: files
+        min_bytes: 1MB
+        newer_than: 36h
+      - type: mysql
+        dump: "*.sql.gz"
+        image: mariadb:11
+        min_tables: 50
+        check_tables: true
+        checks:
+          - name: users present
+            sql: "SELECT count(*) FROM oc_users"
+            expect_min: 1
+          - name: filecache populated
+            sql: "SELECT count(*) FROM oc_filecache"
+            expect_min: 1000
+
+  # ------------------------------------------------------------------
+  # 5) ZFS — no copying at all. The snapshot is cloned read-only, the
+  #    checks run against the mountpoint, the clone is destroyed after.
+  #    Makes multi-TB datasets verifiable in seconds instead of hours.
+  # ------------------------------------------------------------------
+  - name: proxmox-vmdata
+    source:
+      type: zfs
+      dataset: rpool/data/vmdata
+      snapshot: random
+      clone_base: rpool/restore-guard   # must contain "restore-guard"
+    verify:
+      - type: files
+        min_files: 10
+        min_bytes: 1GB
+    max_age: 14d
+
+  # ------------------------------------------------------------------
+  # 6) Anything else: run your own script against the restore.
   # ------------------------------------------------------------------
   - name: photos-checksums
     enabled: false

@@ -2,8 +2,6 @@
 
 import time
 
-import pytest
-
 from restore_guard.config import build_config
 from restore_guard.report import collect, prometheus_metrics, status_table
 from restore_guard.runner import Runner

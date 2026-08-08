@@ -201,7 +201,138 @@ def prometheus_metrics(statuses: list[JobStatus]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_metrics(path: Path, content: str) -> None:
+_HTML_TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="300">
+<title>restore-guard</title>
+<style>
+:root {{
+  color-scheme: light dark;
+  --bg: #f6f7f9; --fg: #14161a; --muted: #5b6270; --card: #ffffff;
+  --line: #dfe3ea; --ok: #1a7f47; --warn: #9a6700; --bad: #b42318; --off: #6b7280;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #14161a; --fg: #e7e9ee; --muted: #9aa2b1; --card: #1c1f26;
+    --line: #2c313b; --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --off: #7c8394;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0; padding: 2rem 1rem; background: var(--bg); color: var(--fg);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}}
+main {{ max-width: 62rem; margin: 0 auto; }}
+h1 {{ font-size: 1.35rem; margin: 0 0 .25rem; letter-spacing: -.01em; }}
+.sub {{ color: var(--muted); font-size: .875rem; margin: 0 0 1.5rem; }}
+.banner {{
+  padding: .75rem 1rem; border-radius: .5rem; margin-bottom: 1.5rem;
+  font-weight: 600; border: 1px solid var(--line); background: var(--card);
+}}
+.banner.ok {{ color: var(--ok); }}
+.banner.bad {{ color: var(--bad); }}
+.wrap {{ overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: .5rem; }}
+table {{ border-collapse: collapse; width: 100%; font-size: .9rem; }}
+th, td {{ text-align: left; padding: .7rem .9rem; border-bottom: 1px solid var(--line); white-space: nowrap; }}
+th {{ font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); font-weight: 600; }}
+tr:last-child td {{ border-bottom: 0; }}
+td.detail {{ white-space: normal; color: var(--muted); min-width: 16rem; }}
+.pill {{
+  display: inline-block; padding: .15rem .5rem; border-radius: 999px;
+  font-size: .75rem; font-weight: 700; letter-spacing: .03em;
+  border: 1px solid currentColor;
+}}
+.OK {{ color: var(--ok); }} .STALE {{ color: var(--warn); }}
+.FAIL, .NEVER {{ color: var(--bad); }} .OFF {{ color: var(--off); }}
+.job {{ font-weight: 600; }}
+code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .85em; color: var(--muted); }}
+footer {{ margin-top: 1.25rem; color: var(--muted); font-size: .8rem; }}
+</style>
+</head>
+<body>
+<main>
+  <h1>restore-guard</h1>
+  <p class="sub">When was each backup last proven restorable?</p>
+  <div class="banner {banner_class}">{banner_text}</div>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr><th>Job</th><th>Status</th><th>Verified</th><th>Snapshot</th>
+            <th>Size</th><th>Took</th><th>Detail</th></tr>
+      </thead>
+      <tbody>
+{rows}
+      </tbody>
+    </table>
+  </div>
+  <footer>Generated {generated} &middot; page refreshes every 5 minutes</footer>
+</main>
+</body>
+</html>
+"""
+
+
+def html_report(statuses: list[JobStatus]) -> str:
+    """A self-contained status page for a homelab dashboard.
+
+    No external assets: an artifact that reports on backups must not need the
+    network to render, least of all while you are recovering from an outage.
+    """
+    broken = [s for s in statuses if not s.healthy]
+    if broken:
+        banner_class = "bad"
+        banner_text = f"{len(broken)} of {len(statuses)} job(s) need attention"
+    else:
+        banner_class = "ok"
+        banner_text = f"All {len(statuses)} job(s) verified restorable"
+
+    rows = []
+    for status in statuses:
+        success = status.last_success
+        run = status.last_run
+        if run is not None and not run.ok and run.message:
+            detail = run.message.splitlines()[0][:200]
+        elif status.stale and success is not None:
+            detail = f"older than {human_duration(status.max_age)}"
+        elif success is None:
+            detail = "never successfully verified"
+        else:
+            detail = ""
+
+        rows.append(
+            "        <tr>"
+            f"<td class=\"job\">{_html(status.name)}</td>"
+            f"<td><span class=\"pill {status.label}\">{status.label}</span></td>"
+            f"<td>{_html(human_duration(status.success_age) + ' ago') if success else 'never'}</td>"
+            f"<td><code>{_html((success.snapshot_id or '-')[:24]) if success else '-'}</code></td>"
+            f"<td>{human_bytes(success.bytes) if success else '-'}</td>"
+            f"<td>{human_duration(success.duration) if success else '-'}</td>"
+            f"<td class=\"detail\">{_html(detail)}</td>"
+            "</tr>"
+        )
+
+    return _HTML_TEMPLATE.format(
+        banner_class=banner_class,
+        banner_text=_html(banner_text),
+        rows="\n".join(rows),
+        generated=time.strftime("%Y-%m-%d %H:%M:%S %Z"),
+    )
+
+
+def _html(value: str) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def write_atomic(path: Path, content: str) -> None:
     """Write atomically: node_exporter may read the file at any moment."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".tmp")

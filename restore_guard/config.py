@@ -52,7 +52,9 @@ class Config:
     notify: list[NotifyTarget] = field(default_factory=list)
     keep_on_failure: bool = True
     history_limit: int = 200
+    parallel: int = 1
     metrics_file: Path | None = None
+    report_file: Path | None = None
     source_path: Path | None = None
 
     @property
@@ -143,6 +145,12 @@ def build_config(raw: dict[str, Any]) -> Config:
 
     metrics_file = defaults.get("metrics_file")
     metrics_path = Path(metrics_file).expanduser() if metrics_file else None
+    report_file = defaults.get("report_file")
+    report_path = Path(report_file).expanduser() if report_file else None
+
+    parallel = int(defaults.get("parallel", 1))
+    if parallel < 1:
+        raise ConfigError(f"defaults.parallel must be >= 1, got {parallel}")
 
     raw_jobs = raw.get("jobs")
     if not raw_jobs:
@@ -165,7 +173,9 @@ def build_config(raw: dict[str, Any]) -> Config:
         notify=_build_notify(raw.get("notify")),
         keep_on_failure=keep_on_failure,
         history_limit=history_limit,
+        parallel=parallel,
         metrics_file=metrics_path,
+        report_file=report_path,
     )
 
 

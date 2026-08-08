@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -70,12 +71,18 @@ class RunRecord:
 
 
 class State:
-    """Thin wrapper around SQLite. Safe to open concurrently; writes are short."""
+    """Thread-safe wrapper around SQLite.
+
+    Jobs may run in parallel (``run --parallel N``), so every access goes
+    through one lock. The critical sections are microseconds of SQLite work,
+    never a restore, so contention is irrelevant.
+    """
 
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path), timeout=30.0)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(str(self.path), timeout=30.0, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
@@ -93,7 +100,8 @@ class State:
             )
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     def __enter__(self) -> "State":
         return self
@@ -102,29 +110,30 @@ class State:
         self.close()
 
     def record(self, run: RunRecord) -> RunRecord:
-        cursor = self._conn.execute(
-            """
-            INSERT INTO runs (job, status, started_at, finished_at, duration,
-                              snapshot_id, snapshot_time, files, bytes, message, details)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                run.job,
-                run.status,
-                run.started_at,
-                run.finished_at,
-                run.duration,
-                run.snapshot_id,
-                run.snapshot_time,
-                run.files,
-                run.bytes,
-                run.message,
-                json.dumps(run.details, default=str),
-            ),
-        )
-        self._conn.commit()
-        run.id = cursor.lastrowid
-        return run
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO runs (job, status, started_at, finished_at, duration,
+                                  snapshot_id, snapshot_time, files, bytes, message, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.job,
+                    run.status,
+                    run.started_at,
+                    run.finished_at,
+                    run.duration,
+                    run.snapshot_id,
+                    run.snapshot_time,
+                    run.files,
+                    run.bytes,
+                    run.message,
+                    json.dumps(run.details, default=str),
+                ),
+            )
+            self._conn.commit()
+            run.id = cursor.lastrowid
+            return run
 
     def last_run(self, job: str) -> RunRecord | None:
         return self._one(
@@ -138,43 +147,47 @@ class State:
         )
 
     def history(self, job: str | None = None, limit: int = 20) -> list[RunRecord]:
-        if job:
-            rows = self._conn.execute(
-                "SELECT * FROM runs WHERE job = ? ORDER BY started_at DESC LIMIT ?",
-                (job, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
-            ).fetchall()
+        with self._lock:
+            if job:
+                rows = self._conn.execute(
+                    "SELECT * FROM runs WHERE job = ? ORDER BY started_at DESC LIMIT ?",
+                    (job, limit),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,)
+                ).fetchall()
         return [_row_to_record(row) for row in rows]
 
     def jobs_seen(self) -> list[str]:
-        rows = self._conn.execute("SELECT DISTINCT job FROM runs ORDER BY job").fetchall()
+        with self._lock:
+            rows = self._conn.execute("SELECT DISTINCT job FROM runs ORDER BY job").fetchall()
         return [row["job"] for row in rows]
 
     def prune(self, keep_per_job: int) -> int:
         """Keep only the newest ``keep_per_job`` runs per job. Returns rows deleted."""
         if keep_per_job <= 0:
             return 0
-        cursor = self._conn.execute(
-            """
-            DELETE FROM runs
-            WHERE id NOT IN (
-                SELECT id FROM runs r
-                WHERE (
-                    SELECT COUNT(*) FROM runs r2
-                    WHERE r2.job = r.job AND r2.started_at >= r.started_at
-                ) <= ?
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM runs
+                WHERE id NOT IN (
+                    SELECT id FROM runs r
+                    WHERE (
+                        SELECT COUNT(*) FROM runs r2
+                        WHERE r2.job = r.job AND r2.started_at >= r.started_at
+                    ) <= ?
+                )
+                """,
+                (keep_per_job,),
             )
-            """,
-            (keep_per_job,),
-        )
-        self._conn.commit()
-        return cursor.rowcount
+            self._conn.commit()
+            return cursor.rowcount
 
     def _one(self, sql: str, params: Iterable[Any]) -> RunRecord | None:
-        row = self._conn.execute(sql, tuple(params)).fetchone()
+        with self._lock:
+            row = self._conn.execute(sql, tuple(params)).fetchone()
         return _row_to_record(row) if row else None
 
 

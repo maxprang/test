@@ -47,10 +47,10 @@ Repository, es kennt nur Lesen und Wiederherstellen.
 Zwei Erweiterungspunkte, beide über ein Registry-Decorator (`@register`):
 
 - **Source** (`restore_guard/sources/`) — kann Snapshots auflisten und einen in
-  ein Verzeichnis wiederherstellen. Aktuell `restic`, `borg`, `local`.
+  ein Verzeichnis wiederherstellen. Aktuell `restic`, `borg`, `local`, `zfs`.
 - **Verifier** (`restore_guard/verifiers/`) — bekommt ein wiederhergestelltes
   Verzeichnis und sagt ja oder nein. Aktuell `files`, `sqlite`, `command`,
-  `postgres`, `http`.
+  `postgres`, `mysql`, `http`.
 
 Ein neuer Typ ist eine Datei plus ein Import in `_load_builtins()` bzw.
 `build_source()`. Beide Basisklassen validieren ihre Config im Konstruktor, damit
@@ -102,6 +102,53 @@ Docker-SDK würde eine Abhängigkeit und eine API-Versionsfrage einführen für
 einen Funktionsumfang, den sechs `subprocess`-Aufrufe abdecken. Einzige
 Laufzeitabhängigkeit ist PyYAML.
 
+### Wer mountet, räumt selbst auf
+
+Die ersten drei Quellen kopierten Dateien; der Runner konnte den Restore danach
+einfach löschen. Der ZFS-Source bricht diese Annahme: unter dem
+Restore-Verzeichnis liegt ein gemountetes Dataset, und ein `rm -rf` würde durch
+den Mount hindurch in echte Daten laufen.
+
+Deshalb gibt es `Source.manages_destination`. Ist es gesetzt, ruft der Runner
+`source.cleanup()` statt zu löschen, und entfernt das Verzeichnis erst, wenn es
+nachweislich leer ist. Ein Fehler im Cleanup wird protokolliert, überschreibt
+aber nie das Urteil des Jobs — ein hängengebliebener Clone ist ein Platzproblem,
+ein verfälschtes Urteil ein Vertrauensproblem.
+
+`zfs destroy` ist der einzige destruktive Befehl im Programm und läuft
+unbeaufsichtigt um 03:30. Er ist dreifach abgesichert: Name enthält
+`restore-guard`, `origin`-Property ist gesetzt (es ist wirklich ein Clone), keine
+Kind-Datasets. Fällt eine Prüfung durch, bleibt der Clone stehen. Die Tests
+faken die ZFS-CLI und prüfen genau diese Logik — die riskante Stelle ist, *welchen
+Namen* wir an `destroy` übergeben, nicht ob das Kernelmodul funktioniert.
+
+### Threads für Parallelität, Locks an genau zwei Stellen
+
+Jobs verbringen ihre Zeit im Warten auf restic, tar oder docker — der GIL ist nie
+der Engpass, also Threads statt Prozesse. Thread-safe gemacht wurden nur zwei
+Dinge: die SQLite-Verbindung (ein `RLock` um jeden Zugriff; die kritischen
+Abschnitte sind Mikrosekunden, nie ein Restore) und der Logger (sonst
+verschränken sich Zeilen genau dann, wenn etwas schiefgeht und man sie lesen
+muss). Ergebnisse werden in Config-Reihenfolge zurückgegeben, damit die
+Statustabelle zwischen Läufen nicht durcheinanderpurzelt.
+
+Default bleibt `parallel: 1`. Bei wenigen großen Jobs sind drei gleichzeitige
+Restores von derselben NAS langsamer als drei nacheinander.
+
+### Stichprobe statt Vollprüfung
+
+Ursprünglich als „Teil-Restore per Stichprobe" geplant, dann verworfen: dafür
+müsste jede Quelle ihre Dateien einzeln auflisten und adressieren können, was
+für borg und tar unschön wird. restic kann das Richtige bereits selbst, also
+gibt es stattdessen `read_data_subset: 2%` — `restic check --read-data-subset`
+im Preflight. Das prüft die Pack-Dateien direkt, also auch Blobs, die kein
+wiederhergestelltes Snapshot berührt. Über einen Monat läuft das Repository
+einmal komplett durch, ohne dass je eine Nacht blockiert ist.
+
+Ein fremdes Feature zu benutzen statt ein eigenes halb zu bauen, ist hier die
+bessere Lösung — auch wenn es bedeutet, dass borg und local diese Prüfung nicht
+haben.
+
 ### Timeouts als Budget, nicht pro Schritt
 
 `timeout` gilt für den ganzen Job. Der Restore verbraucht davon, die Verifier
@@ -120,6 +167,8 @@ konfiguriert man fünf Timeouts und weiß nie, welcher gegriffen hat.
 | Dump lädt sauber, ist aber die leere Schema-Version | `postgres` `checks` mit `expect_min` |
 | Ein einzelner kritischer Pfad fehlt (Keyfile, Config) | `files` `must_exist` |
 | Retention hat alte Snapshots beschädigt | `snapshot: random` |
+| `mysqldump` ohne `--single-transaction` erwischte Tabellen im Schreiben | `mysql` mit `check_tables: true` |
+| Bit Rot in Blobs, die kein geprüftes Snapshot anfasst | restic `read_data_subset` |
 | Verschlüsselung ohne gültige Passphrase | `preflight` → `ERROR` |
 
 Was es **nicht** fängt, und das ehrlich: ob deine Wiederherstellungs-*Prozedur*
@@ -143,15 +192,30 @@ Die Angriffsfläche ist bewusst klein, aber nicht null:
   auch wenn der Check abstürzt.
 - **Empfohlen: read-only Repo-Zugang.** restore-guard braucht nur Lesen. Ein
   kompromittierter Prüfer soll nicht die Backups löschen können.
+- **`zfs destroy` ist dreifach abgesichert** (siehe oben) und ist der einzige
+  Befehl im Programm, der etwas zerstören kann.
+- **Die HTML-Seite escaped alle Werte** und lädt nichts nach. Jobnamen und
+  Fehlermeldungen landen darin, und die Seite hängt womöglich öffentlich im
+  Dashboard.
 
-## Nächste sinnvolle Schritte
+## Stand und offene Punkte
 
-1. **MySQL/MariaDB-Verifier** — dasselbe Muster wie `postgres`.
-2. **`--parallel N`** — Jobs laufen aktuell seriell. Bei vielen kleinen Jobs
-   nervt das; bei wenigen großen ist seriell richtig, weil die NAS sonst
-   einbricht.
-3. **ZFS/Btrfs-Source** — `zfs send` in ein temporäres Dataset statt Dateikopie.
-   Deutlich schneller für große Datasets.
-4. **Statusseite** — die Tabelle als HTML, in ein Homelab-Dashboard einbindbar.
-5. **Teil-Restore per Stichprobe** — bei mehreren TB nicht alles, sondern N
-   zufällige Dateien plus Prüfsummenvergleich gegen das Original.
+Umgesetzt: alle ursprünglich geplanten Erweiterungen — MySQL/MariaDB-Verifier,
+`--parallel N`, ZFS-Source, HTML-Statusseite, Stichprobenprüfung (als restic
+`read_data_subset`, siehe oben).
+
+Was bewusst offen bleibt:
+
+1. **Btrfs bekommt keine eigene Quelle.** Dessen Snapshots sind bereits
+   Verzeichnisse — `type: local` mit `pattern` deckt sie ohne neuen Code ab.
+   Eine eigene Quelle wäre Dopplung ohne Gewinn.
+2. **Der ZFS-Source ist nicht gegen echtes ZFS getestet.** Die Tests faken die
+   CLI und decken Namensberechnung und Sicherheitscheck ab; ein Lauf gegen ein
+   Wegwerf-Dataset auf echter Hardware fehlt.
+3. **Kein Verifier für Restic-interne Konsistenz bei borg.** borg hat mit
+   `borg check --verify-data` ein Äquivalent zu `read_data_subset`, aber ohne
+   Teilmengen-Option — es gibt nur ganz oder gar nicht, und „ganz" ist auf
+   großen Repos keine nächtliche Option.
+4. **Wiederherstellungs-Reihenfolge.** Ein grüner Lauf sagt „die Daten sind
+   heil", nicht „du weißt, wie du die 14 Dienste wieder hochziehst". Das wäre
+   eher ein Runbook-Generator als ein Prüfer — und damit ein eigenes Projekt.

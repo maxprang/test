@@ -18,10 +18,11 @@ from .notify import notify
 from .report import (
     collect,
     history_table,
+    html_report,
     json_report,
     prometheus_metrics,
     status_table,
-    write_metrics,
+    write_atomic,
 )
 from .runner import Runner
 from .sources import known_sources
@@ -35,18 +36,35 @@ EXIT_CONFIG = 2
 
 
 def build_parser() -> argparse.ArgumentParser:
+    # Shared flags, accepted on either side of the subcommand: `-q run` and
+    # `run -q` both work. SUPPRESS matters — without it the subparser's default
+    # would overwrite a value given before the subcommand.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--config", "-c", default=argparse.SUPPRESS, help="path to config.yml"
+    )
+    common.add_argument(
+        "--verbose", "-v", action="store_true", default=argparse.SUPPRESS,
+        help="log every check",
+    )
+    common.add_argument(
+        "--quiet", "-q", action="store_true", default=argparse.SUPPRESS,
+        help="only report problems",
+    )
+
     parser = argparse.ArgumentParser(
         prog="restore-guard",
         description="Prove that your backups can actually be restored.",
+        parents=[common],
     )
-    parser.add_argument("--config", "-c", help="path to config.yml")
-    parser.add_argument("--verbose", "-v", action="store_true", help="log every check")
-    parser.add_argument("--quiet", "-q", action="store_true", help="only report problems")
     parser.add_argument("--version", action="version", version=f"restore-guard {__version__}")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    run_cmd = sub.add_parser("run", help="restore and verify one or all jobs")
+    def add(name: str, **kwargs) -> argparse.ArgumentParser:
+        return sub.add_parser(name, parents=[common], **kwargs)
+
+    run_cmd = add("run", help="restore and verify one or all jobs")
     run_cmd.add_argument("jobs", nargs="*", help="job names (default: all enabled jobs)")
     run_cmd.add_argument(
         "--dry-run",
@@ -54,18 +72,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="reach the repository and pick a snapshot, but do not restore",
     )
     run_cmd.add_argument("--no-notify", action="store_true", help="suppress notifications")
+    run_cmd.add_argument(
+        "--parallel",
+        type=int,
+        metavar="N",
+        help="verify up to N jobs at once (overrides defaults.parallel)",
+    )
 
-    status_cmd = sub.add_parser("status", help="show when each backup was last proven restorable")
-    status_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+    status_cmd = add("status", help="show when each backup was last proven restorable")
+    output = status_cmd.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="machine-readable output")
+    output.add_argument(
+        "--html",
+        nargs="?",
+        const="-",
+        metavar="FILE",
+        help="write a self-contained status page (default: stdout)",
+    )
 
-    history_cmd = sub.add_parser("history", help="show recent runs")
+    history_cmd = add("history", help="show recent runs")
     history_cmd.add_argument("job", nargs="?", help="limit to one job")
     history_cmd.add_argument("--limit", type=int, default=20)
     history_cmd.add_argument("--json", action="store_true")
 
-    sub.add_parser("validate", help="check the config file and exit")
-    sub.add_parser("metrics", help="print (and optionally write) Prometheus metrics")
-    sub.add_parser("plugins", help="list available source and verifier types")
+    add("validate", help="check the config file and exit")
+    add("metrics", help="print (and optionally write) Prometheus metrics")
+    add("plugins", help="list available source and verifier types")
 
     return parser
 
@@ -73,6 +105,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args.verbose = getattr(args, "verbose", False)
+    args.quiet = getattr(args, "quiet", False)
+    args.config = getattr(args, "config", None)
     logger = Logger(verbose=args.verbose, quiet=args.quiet)
 
     if args.command == "plugins":
@@ -104,8 +139,9 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_run(args, config: Config, logger: Logger) -> int:
+    parallel = args.parallel if args.parallel else config.parallel
     with State(config.state_path) as state:
-        runner = Runner(config, state, logger, dry_run=args.dry_run)
+        runner = Runner(config, state, logger, dry_run=args.dry_run, parallel=parallel)
         outcomes = runner.run_all(only=args.jobs or None)
 
         if not args.no_notify and not args.dry_run:
@@ -113,7 +149,9 @@ def _cmd_run(args, config: Config, logger: Logger) -> int:
 
         statuses = collect(config, state)
         if config.metrics_file:
-            write_metrics(config.metrics_file, prometheus_metrics(statuses))
+            write_atomic(config.metrics_file, prometheus_metrics(statuses))
+        if config.report_file:
+            write_atomic(config.report_file, html_report(statuses))
 
         if not args.quiet:
             print()
@@ -126,7 +164,18 @@ def _cmd_run(args, config: Config, logger: Logger) -> int:
 def _cmd_status(args, config: Config, logger: Logger) -> int:
     with State(config.state_path) as state:
         statuses = collect(config, state)
-    print(json_report(statuses) if args.json else status_table(statuses))
+
+    if args.json:
+        print(json_report(statuses))
+    elif args.html:
+        content = html_report(statuses)
+        if args.html == "-":
+            print(content, end="")
+        else:
+            write_atomic(Path(args.html), content)
+            print(f"written to {args.html}")
+    else:
+        print(status_table(statuses))
     return EXIT_OK if all(status.healthy for status in statuses) else EXIT_PROBLEM
 
 
@@ -169,7 +218,7 @@ def _cmd_metrics(args, config: Config, logger: Logger) -> int:
     with State(config.state_path) as state:
         content = prometheus_metrics(collect(config, state))
     if config.metrics_file:
-        write_metrics(config.metrics_file, content)
+        write_atomic(config.metrics_file, content)
         print(f"# written to {config.metrics_file}")
     print(content, end="")
     return EXIT_OK

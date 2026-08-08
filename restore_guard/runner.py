@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,27 +38,59 @@ class JobOutcome:
 
 
 class Runner:
-    def __init__(self, config: Config, state: State, logger: Logger, dry_run: bool = False):
+    def __init__(
+        self,
+        config: Config,
+        state: State,
+        logger: Logger,
+        dry_run: bool = False,
+        parallel: int = 1,
+    ):
         self.config = config
         self.state = state
         self.log = logger
         self.dry_run = dry_run
+        self.parallel = max(1, int(parallel))
 
     def run_all(self, only: list[str] | None = None) -> list[JobOutcome]:
         jobs = self.config.jobs
         if only:
             jobs = [self.config.job(name) for name in only]
 
-        outcomes = []
+        selected = []
         for job in jobs:
             if not job.enabled and not only:
                 self.log.info(f"{job.name}: disabled, skipping")
                 continue
-            outcomes.append(self.run_job(job))
+            selected.append(job)
+
+        if self.parallel > 1 and len(selected) > 1:
+            outcomes = self._run_parallel(selected)
+        else:
+            outcomes = [self.run_job(job) for job in selected]
 
         if self.config.history_limit:
             self.state.prune(self.config.history_limit)
         return outcomes
+
+    def _run_parallel(self, jobs: list[JobConfig]) -> list[JobOutcome]:
+        """Run jobs on a thread pool.
+
+        Threads, not processes: every job spends its time waiting on restic,
+        tar or docker, so the GIL is never the bottleneck. Results are returned
+        in config order regardless of completion order, so the status table
+        does not reshuffle itself between runs.
+        """
+        workers = min(self.parallel, len(jobs))
+        self.log.info(f"running {len(jobs)} jobs, {workers} at a time")
+
+        results: dict[str, JobOutcome] = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="rg-job") as pool:
+            futures = {pool.submit(self.run_job, job): job for job in jobs}
+            for future in as_completed(futures):
+                job = futures[future]
+                results[job.name] = future.result()
+        return [results[job.name] for job in jobs]
 
     def run_job(self, job: JobConfig) -> JobOutcome:
         previous = self.state.last_run(job.name)
@@ -67,6 +100,7 @@ class Runner:
         self.log.step(f"{job.name}: starting verification")
         restore_dir = self._restore_dir(job)
         snapshot: Snapshot | None = None
+        source = None
         keep = job.keep_on_failure if job.keep_on_failure is not None else self.config.keep_on_failure
 
         try:
@@ -136,7 +170,7 @@ class Runner:
                 message=f"unexpected {type(exc).__name__}: {exc}",
             )
 
-        kept = self._cleanup(restore_dir, record.status == STATUS_OK, keep, job)
+        kept = self._cleanup(source, restore_dir, record.status == STATUS_OK, keep, job)
         return JobOutcome(record, previous, restore_dir if kept else None)
 
     # -- internals -----------------------------------------------------
@@ -188,14 +222,37 @@ class Runner:
         stamp = time.strftime("%Y%m%dT%H%M%S")
         return self.config.restores_path / f"{job.name}-{stamp}-{os.getpid()}"
 
-    def _cleanup(self, restore_dir: Path, succeeded: bool, keep_on_failure: bool, job: JobConfig) -> bool:
+    def _cleanup(
+        self,
+        source,
+        restore_dir: Path,
+        succeeded: bool,
+        keep_on_failure: bool,
+        job: JobConfig,
+    ) -> bool:
+        """Release the restore. Returns True if it was deliberately left behind."""
         if not restore_dir.exists():
             return False
-        if succeeded or not keep_on_failure:
-            rmtree_quiet(restore_dir)
+
+        if not succeeded and keep_on_failure:
+            self.log.info(f"{job.name}: restore kept for inspection at {restore_dir}")
+            return True
+
+        # A source that mounts something (ZFS clone) must tear it down itself —
+        # deleting the directory would delete through the mount into live data.
+        if source is not None and getattr(source, "manages_destination", False):
+            try:
+                source.cleanup(restore_dir, succeeded)
+            except Exception as exc:  # cleanup must never mask the job's verdict
+                self.log.fail(f"{job.name}: cleanup failed: {exc}")
+                return True
+            # Only remove the mountpoint once the source has emptied it.
+            if restore_dir.exists() and not any(restore_dir.iterdir()):
+                rmtree_quiet(restore_dir)
             return False
-        self.log.info(f"{job.name}: restore kept for inspection at {restore_dir}")
-        return True
+
+        rmtree_quiet(restore_dir)
+        return False
 
     def _record(
         self,

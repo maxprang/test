@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -256,17 +257,24 @@ def expand_placeholders(value, mapping: dict[str, str]):
 
 @dataclass
 class Logger:
-    """Deliberately tiny logger: stdout, optional verbosity, remembers lines for reports."""
+    """Deliberately tiny logger: stdout, optional verbosity, remembers lines for reports.
+
+    Locked because parallel jobs log from several threads; without it lines
+    interleave mid-sentence and the output becomes unreadable exactly when
+    something has gone wrong.
+    """
 
     verbose: bool = False
     quiet: bool = False
     lines: list[str] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def _emit(self, prefix: str, message: str) -> None:
         line = f"{prefix} {message}" if prefix else message
-        self.lines.append(line)
-        if not self.quiet:
-            print(line, flush=True)
+        with self._lock:
+            self.lines.append(line)
+            if not self.quiet:
+                print(line, flush=True)
 
     def info(self, message: str) -> None:
         self._emit("  ", message)

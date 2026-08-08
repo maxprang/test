@@ -88,6 +88,16 @@ class Source(ABC):
     def restore(self, snapshot: Snapshot, dest: Path, timeout: float) -> RestoreOutcome:
         ...
 
+    #: True when ``restore`` hands back something other than a plain copy of
+    #: files — a ZFS clone mounted at ``dest``, for example. The runner must
+    #: then call ``cleanup`` instead of deleting the directory, or it would
+    #: happily rm -rf its way through a live dataset.
+    manages_destination: bool = False
+
+    def cleanup(self, restore_dir: Path, succeeded: bool) -> None:
+        """Release whatever ``restore`` acquired. Only called when the source
+        manages the destination; plain copies are removed by the runner."""
+
     def select(self, snapshots: list[Snapshot]) -> Snapshot:
         """Pick the snapshot to verify.
 
@@ -123,8 +133,12 @@ def register(cls: type[Source]) -> type[Source]:
     return cls
 
 
+def _load_builtins() -> None:
+    from . import borg, local, restic, zfs  # noqa: F401  (import registers the classes)
+
+
 def build_source(job: JobConfig, logger: Logger) -> Source:
-    from . import borg, local, restic  # noqa: F401  (import registers the classes)
+    _load_builtins()
 
     kind = str(job.source.get("type", "")).lower()
     if kind not in _REGISTRY:
@@ -134,6 +148,5 @@ def build_source(job: JobConfig, logger: Logger) -> Source:
 
 
 def known_sources() -> list[str]:
-    from . import borg, local, restic  # noqa: F401
-
+    _load_builtins()
     return sorted(_REGISTRY)

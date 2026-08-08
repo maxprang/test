@@ -84,7 +84,14 @@ def register(cls: type[Verifier]) -> type[Verifier]:
 
 
 def _load_builtins() -> None:
-    from . import command, files, http_service, postgres, sqlite_db  # noqa: F401
+    from . import (  # noqa: F401
+        command,
+        files,
+        http_service,
+        mysql,
+        postgres,
+        sqlite_db,
+    )
 
 
 def build_verifiers(job: JobConfig) -> list[Verifier]:
